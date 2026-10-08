@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     clickhouse_url: str = "http://localhost:8123"
     clickhouse_database: str = "notifications"
+    clickhouse_user: str = "default"
+    clickhouse_password: str = ""
     clickhouse_enabled: bool = True
 
     # Delivery policy.
