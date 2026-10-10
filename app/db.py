@@ -31,16 +31,23 @@ def get_engine() -> Engine:
     return _engine
 
 
+# expire_on_commit=False: rows stay usable after a mid-task commit, so the
+# worker can drop its transaction before making a network call and still read
+# the fields it needs afterwards.
+def _session() -> Session:
+    return Session(get_engine(), expire_on_commit=False)
+
+
 def get_session() -> Iterator[Session]:
     """FastAPI dependency."""
-    with Session(get_engine()) as session:
+    with _session() as session:
         yield session
 
 
 @contextmanager
 def session_scope() -> Iterator[Session]:
     """Worker-side transaction: commit on success, roll back on any error."""
-    with Session(get_engine()) as session:
+    with _session() as session:
         try:
             yield session
             session.commit()
