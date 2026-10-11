@@ -80,3 +80,15 @@ class StatsOut(BaseModel):
     window_seconds: int
     total: int
     by_status: StatusCounts
+
+
+class EventCount(BaseModel):
+    event: str
+    total: int
+    avg_duration_ms: float
+    last_seen: datetime | None
+
+
+class EventStatsOut(BaseModel):
+    window_seconds: int
+    events: list[EventCount]
