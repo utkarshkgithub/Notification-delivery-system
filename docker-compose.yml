@@ -1,0 +1,148 @@
+name: notification-infra
+
+x-app: &app
+  build: .
+  image: notification-infra:local
+  environment: &app-env
+    DATABASE_URL: postgresql+psycopg://ntf:ntf@postgres:5432/notifications
+    REDIS_URL: redis://redis:6379/0
+    CLICKHOUSE_URL: http://clickhouse:8123
+    CLICKHOUSE_DATABASE: notifications
+    CLICKHOUSE_USER: default
+    CLICKHOUSE_PASSWORD: devpassword
+    LOG_LEVEL: INFO
+    # Tighter than production so the retry ladder is visible in a demo.
+    RETRY_BASE_SECONDS: "1"
+    RETRY_CAP_SECONDS: "30"
+    STUCK_DELIVERY_TIMEOUT_SECONDS: "20"
+    RECLAIMER_INTERVAL_SECONDS: "10"
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    clickhouse:
+      condition: service_started
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ntf
+      POSTGRES_PASSWORD: ntf
+      POSTGRES_DB: notifications
+    ports:
+      - "5432:5432" # exposed so the test suite can run from the host
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ntf -d notifications"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # appendonly: the broker holds queued and scheduled-retry messages, so a
+    # restart without AOF would silently drop accepted notifications.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    environment:
+      CLICKHOUSE_DB: notifications
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: devpassword
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "8123:8123"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - chdata:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    <<: *app
+    command:
+      ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+    environment:
+      <<: *app-env
+      RUN_MIGRATIONS: "true"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  worker:
+    <<: *app
+    command:
+      [
+        "celery",
+        "-A",
+        "app.tasks",
+        "worker",
+        "--loglevel=info",
+        "--concurrency=4",
+        "--without-gossip",
+        "--without-mingle",
+      ]
+    environment:
+      <<: *app-env
+      # Must match the broker visibility timeout so a stuck delivery is
+      # reclaimed by beat rather than after the broker gives up on it.
+      METRICS_PORT: "9101"
+    ports:
+      - "9101:9101"
+
+  beat:
+    <<: *app
+    command: ["celery", "-A", "app.tasks", "beat", "--loglevel=info"]
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=6h"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  # Not part of the delivery path. It is the "customer's server" for local
+  # demos and for the load test, so webhook deliveries land somewhere real.
+  demo-receiver:
+    <<: *app
+    command: ["python", "scripts/webhook_receiver.py", "--port", "8090"]
+    environment:
+      <<: *app-env
+      # Set this to a tenant's webhook secret to get signature verification
+      # in the log: WEBHOOK_SECRET=... docker compose up demo-receiver
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+    ports:
+      - "8090:8090"
+
+volumes:
+  pgdata:
+  redisdata:
+  chdata:
