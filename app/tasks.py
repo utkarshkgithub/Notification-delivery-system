@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 from celery import Celery
 from celery.signals import worker_ready
-from sqlalchemy import func, update
+from sqlalchemy import func, select, update
 
 from app import events
 from app.cache import cache_delete, notification_key
@@ -30,6 +30,7 @@ from app.metrics import (
     DELIVERY_DURATION,
     RETRIES_SCHEDULED,
     STUCK_RECLAIMED,
+    SWEEP_REQUEUED,
 )
 from app.models import DeliveryAttempt, Notification, Outcome, Status
 
@@ -55,7 +56,11 @@ celery_app.conf.update(
         "reclaim-stuck-deliveries": {
             "task": "app.tasks.reclaim_stuck_deliveries",
             "schedule": settings.reclaimer_interval_seconds,
-        }
+        },
+        "sweep-queued-notifications": {
+            "task": "app.tasks.sweep_queued_notifications",
+            "schedule": settings.sweeper_interval_seconds,
+        },
     },
 )
 
@@ -258,6 +263,42 @@ def reclaim_stuck_deliveries(timeout_seconds: int | None = None) -> int:
     if reclaimed:
         log.warning("reclaimed %s stuck deliveries", len(reclaimed))
     return len(reclaimed)
+
+
+@celery_app.task(name="app.tasks.sweep_queued_notifications")
+def sweep_queued_notifications(grace_seconds: int | None = None, batch: int = 500) -> int:
+    """Re-publish notifications that are due but have not been picked up.
+
+    The broker is Redis, so a flush or a dropped message would otherwise lose an
+    accepted notification with no trace. The reclaimer covers a worker dying
+    mid-flight; this covers the message never arriving at all. Both are safe to
+    re-run because attempt_delivery ignores anything already terminal or in
+    flight.
+
+    next_attempt_at is pushed forward so the same batch is not re-published
+    every interval while it is on its way through the queue.
+    """
+    grace = settings.queued_sweep_grace_seconds if grace_seconds is None else grace_seconds
+    cutoff = _now() - timedelta(seconds=grace)
+    with session_scope() as session:
+        due = (
+            session.scalars(
+                select(Notification.id)
+                .where(Notification.status == Status.QUEUED, Notification.next_attempt_at < cutoff)
+                .order_by(Notification.next_attempt_at)
+                .limit(batch)
+            ).all()
+        )
+        if due:
+            session.execute(
+                update(Notification).where(Notification.id.in_(due)).values(next_attempt_at=func.now())
+            )
+    for notification_id in due:
+        SWEEP_REQUEUED.inc()
+        deliver_notification.apply_async(args=[str(notification_id)])
+    if due:
+        log.warning("sweeper re-published %s due-but-untouched notifications", len(due))
+    return len(due)
 
 
 @worker_ready.connect

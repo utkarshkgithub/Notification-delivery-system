@@ -16,6 +16,8 @@ x-app: &app
     RETRY_CAP_SECONDS: "30"
     STUCK_DELIVERY_TIMEOUT_SECONDS: "20"
     RECLAIMER_INTERVAL_SECONDS: "10"
+    QUEUED_SWEEP_GRACE_SECONDS: "15"
+    SWEEPER_INTERVAL_SECONDS: "10"
   depends_on:
     postgres:
       condition: service_healthy

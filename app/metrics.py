@@ -31,6 +31,9 @@ DEAD_LETTERED = Counter(
 STUCK_RECLAIMED = Counter(
     "ntf_stuck_deliveries_reclaimed_total", "Deliveries re-queued after a worker died mid-flight"
 )
+SWEEP_REQUEUED = Counter(
+    "ntf_queued_sweep_requeued_total", "Notifications re-published because they were due but untouched"
+)
 RATE_LIMIT_REJECTED = Counter(
     "ntf_ratelimit_rejected_total", "Requests rejected with 429"
 )

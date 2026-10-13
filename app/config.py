@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     webhook_timeout_seconds: float = 5.0
     stuck_delivery_timeout_seconds: int = 300
     reclaimer_interval_seconds: int = 60
+    # A queued notification that is this far past its due time was accepted but
+    # never picked up (broker flushed, message dropped); the sweeper re-publishes it.
+    queued_sweep_grace_seconds: int = 120
+    sweeper_interval_seconds: int = 60
 
     # Rate limiting, per tenant, unless the tenant row overrides it.
     rate_limit_per_minute: int = 600
