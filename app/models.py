@@ -15,7 +15,6 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
-    desc,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -78,20 +77,22 @@ class Tenant(Base):
 
 class Notification(Base):
     __tablename__ = "notifications"
+    # Four indexes, each with exactly one query behind it:
+    #   due          - the reclaimer and the queued sweeper
+    #   tenant_created - listing, keyset pagination, per-tenant stats window
+    #   idem         - idempotent create (also unique, so it is enforced)
+    # The list index is ASC and read backwards for descending keysets; that is
+    # as fast as a DESC index, and Alembic actually round-trips it.
     __table_args__ = (
-        # The reclaimer and the retry path both scan by status + due time.
         Index("ix_notifications_due", "status", "next_attempt_at"),
-        # Keyset pagination for GET /v1/notifications.
-        Index("ix_notifications_tenant_created", "tenant_id", desc("created_at"), desc("id")),
-        # Status breakdown for GET /v1/stats.
-        Index("ix_notifications_tenant_status", "tenant_id", "status"),
+        Index("ix_notifications_tenant_created", "tenant_id", "created_at", "id"),
         UniqueConstraint("tenant_id", "idempotency_key", name="uq_notifications_tenant_idem"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
-    )
+    # No index=True: the composite (tenant_id, created_at, id) below already
+    # covers every lookup that starts with tenant_id.
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"))
     channel: Mapped[Channel] = mapped_column(_enum(Channel, "notification_channel"))
     status: Mapped[Status] = mapped_column(
         _enum(Status, "notification_status"), default=Status.QUEUED
@@ -126,6 +127,7 @@ class DeliveryAttempt(Base):
 
     # bigserial: this table grows one row per try, so it wants a narrow key.
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # Same reasoning: the (notification_id, attempt) index is also the FK index.
     notification_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("notifications.id", ondelete="CASCADE")
     )
