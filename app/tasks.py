@@ -118,7 +118,9 @@ def attempt_delivery(notification_id: str | uuid.UUID) -> AttemptOutcome:
             # Another attempt is in flight. Sending now would double-deliver.
             return AttemptOutcome(delivered=False, skipped=True)
         if notification.attempts >= notification.max_attempts:
-            return _dead_letter(session, notification, "attempts already exhausted")
+            return _dead_letter(
+                session, notification, "attempts already exhausted when picked up"
+            )
 
         channel = notification.channel.value
         tenant = notification.tenant
@@ -165,15 +167,17 @@ def attempt_delivery(notification_id: str | uuid.UUID) -> AttemptOutcome:
             return AttemptOutcome(delivered=True)
 
         if outcome is Outcome.PERMANENT or attempt_no >= notification.max_attempts:
+            # last_error records why it stopped being retried. The transport's
+            # own message is already in delivery_attempts, so repeating it here
+            # would lose the distinction an operator actually needs: dead after
+            # one rejection, or dead after five tries.
             reason = (
-                "receiver rejected it permanently"
+                f"rejected permanently: {error}"
                 if outcome is Outcome.PERMANENT
-                else f"attempts exhausted after {attempt_no}"
+                else f"attempts exhausted after {attempt_no}: {error}"
             )
             session.commit()  # persist the attempt row before flipping to dead
-            return _dead_letter(
-                session, notification, reason, attempt_no, outcome, duration_ms, status_code, error
-            )
+            return _dead_letter(session, notification, reason, attempt_no, outcome, duration_ms, status_code)
 
         delay = backoff_seconds(attempt_no)
         notification.status = Status.QUEUED
@@ -200,13 +204,12 @@ def _dead_letter(
     outcome: Outcome | None = None,
     duration_ms: int = 0,
     status_code: int | None = None,
-    error: str | None = None,
 ) -> AttemptOutcome:
     notification.status = Status.DEAD
-    notification.last_error = error or reason
+    notification.last_error = reason
     session.commit()
     DEAD_LETTERED.labels(channel=notification.channel.value).inc()
-    _after_commit(notification, "dead", attempt_no, outcome, duration_ms, status_code, error or reason)
+    _after_commit(notification, "dead", attempt_no, outcome, duration_ms, status_code, reason)
     log.warning("notification %s moved to dead letter: %s", notification.id, reason)
     return AttemptOutcome(delivered=False)
 
