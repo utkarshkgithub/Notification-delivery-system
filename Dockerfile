@@ -2,7 +2,10 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    # Scripts run by path (docker/wait_for_db.py) need the app package on the
+    # path; running from cwd is not enough.
+    PYTHONPATH=/srv
 
 WORKDIR /srv
 
