@@ -12,6 +12,7 @@ analytics gets a 503 instead of an empty list that looks like real data.
 """
 
 import logging
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -26,6 +27,10 @@ log = logging.getLogger(__name__)
 
 TABLE = "delivery_events"
 COOLDOWN_SECONDS = 30
+# One failed insert is not an outage. Without this, a single per-call error -
+# which under load is routine - disabled analytics for the whole cooldown and
+# silently dropped everything in between.
+FAILURES_BEFORE_COOLDOWN = 5
 
 DDL = """
 CREATE TABLE IF NOT EXISTS {db}.{table} (
@@ -77,16 +82,22 @@ class ClickHouseUnavailable(RuntimeError):
     pass
 
 
-_client = None
+# Thread-local, not a module global: a clickhouse-connect client holds a single
+# session and raises if two threads use it at once. The worker runs threads, so
+# a shared client meant "dropped events" as soon as deliveries overlapped.
+_local = threading.local()
 _disabled_until = 0.0
 _schema_ready = False
+_consecutive_failures = 0
+_schema_lock = threading.Lock()
+_failure_lock = threading.Lock()
 
 
 def get_client():
-    global _client
-    if _client is None:
+    client = getattr(_local, "client", None)
+    if client is None:
         parsed = urlparse(settings.clickhouse_url)
-        _client = clickhouse_connect.get_client(
+        client = clickhouse_connect.get_client(
             host=parsed.hostname or "localhost",
             port=parsed.port or (8443 if parsed.scheme == "https" else 8123),
             username=settings.clickhouse_user,
@@ -96,17 +107,21 @@ def get_client():
             connect_timeout=3,
             send_receive_timeout=5,
         )
-    return _client
+        _local.client = client
+    return client
 
 
 def ensure_schema() -> None:
     global _schema_ready
     if _schema_ready:
         return
-    client = get_client()
-    client.command(f"CREATE DATABASE IF NOT EXISTS {settings.clickhouse_database}")
-    client.command(DDL.format(db=settings.clickhouse_database, table=TABLE))
-    _schema_ready = True
+    with _schema_lock:
+        if _schema_ready:
+            return
+        client = get_client()
+        client.command(f"CREATE DATABASE IF NOT EXISTS {settings.clickhouse_database}")
+        client.command(DDL.format(db=settings.clickhouse_database, table=TABLE))
+        _schema_ready = True
 
 
 def record(
@@ -143,10 +158,15 @@ def record(
                 ]
             ],
             column_names=COLUMNS,
+            # async_insert lets the server merge these one-row inserts into
+            # shared parts instead of writing a part per row.
+            settings={"async_insert": 1, "wait_for_async_insert": 1},
         )
     except Exception as exc:  # noqa: BLE001 - see module docstring
         CLICKHOUSE_WRITE_ERRORS.inc()
-        _disable(exc)
+        _note_failure(exc)
+        return
+    _note_success()
 
 
 def event_summary(tenant_id: uuid.UUID, window_seconds: int) -> list[dict]:
@@ -159,21 +179,44 @@ def event_summary(tenant_id: uuid.UUID, window_seconds: int) -> list[dict]:
             parameters={"tenant_id": str(tenant_id), "window": window_seconds},
         )
     except Exception as exc:  # noqa: BLE001
-        _disable(exc)
+        _note_failure(exc)
         raise ClickHouseUnavailable(str(exc)) from exc
     return [dict(zip(result.column_names, row)) for row in result.result_rows]
 
 
-def _disable(exc: Exception) -> None:
-    """Stop talking to ClickHouse for a while and drop the connection so the
-    next attempt starts clean."""
-    global _client, _disabled_until, _schema_ready
+def _note_failure(exc: Exception) -> None:
+    """Count the miss, and only pause once the sink looks genuinely down."""
+    global _disabled_until, _schema_ready, _consecutive_failures
+    with _failure_lock:
+        _consecutive_failures += 1
+        if _consecutive_failures < FAILURES_BEFORE_COOLDOWN:
+            log.warning(
+                "clickhouse write failed (%s of %s before pausing): %s",
+                _consecutive_failures,
+                FAILURES_BEFORE_COOLDOWN,
+                exc,
+            )
+            return
+        _consecutive_failures = 0
+        _disabled_until = time.monotonic() + COOLDOWN_SECONDS
+        _schema_ready = False
     log.warning("clickhouse unavailable, pausing analytics for %ss: %s", COOLDOWN_SECONDS, exc)
-    _disabled_until = time.monotonic() + COOLDOWN_SECONDS
-    _schema_ready = False
-    if _client is not None:
+    _drop_client()
+
+
+def _note_success() -> None:
+    global _consecutive_failures
+    if _consecutive_failures:
+        with _failure_lock:
+            _consecutive_failures = 0
+
+
+def _drop_client() -> None:
+    """Drop this thread's connection so the next attempt starts clean."""
+    client = getattr(_local, "client", None)
+    if client is not None:
         try:
-            _client.close()
+            client.close()
         except Exception:  # noqa: BLE001
             pass
-        _client = None
+        _local.client = None

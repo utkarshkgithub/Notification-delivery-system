@@ -38,6 +38,8 @@ def test_disabled_sink_refuses_to_answer_reads(monkeypatch):
 
 def test_write_failure_is_swallowed_and_counted(monkeypatch):
     monkeypatch.setattr(settings, "clickhouse_enabled", True)
+    monkeypatch.setattr(events, "_disabled_until", 0.0)
+    monkeypatch.setattr(events, "_consecutive_failures", 0)
     calls = {"n": 0}
 
     def broken():
@@ -46,25 +48,31 @@ def test_write_failure_is_swallowed_and_counted(monkeypatch):
 
     monkeypatch.setattr(events, "get_client", broken)
 
-    events.record(
-        event="delivered",
-        tenant_id=uuid.uuid4(),
-        notification_id=uuid.uuid4(),
-        channel="in_app",
-    )
-    events.record(
-        event="delivered",
-        tenant_id=uuid.uuid4(),
-        notification_id=uuid.uuid4(),
-        channel="in_app",
-    )
+    def record_once() -> None:
+        events.record(
+            event="delivered",
+            tenant_id=uuid.uuid4(),
+            notification_id=uuid.uuid4(),
+            channel="in_app",
+        )
 
-    assert calls["n"] == 1, "the cooldown must stop a retry storm, not retry per event"
+    # A single failed insert must not black out analytics: under load that is
+    # routine, and pausing on the first one dropped everything for 30s.
+    for _ in range(events.FAILURES_BEFORE_COOLDOWN):
+        record_once()
+    assert calls["n"] == events.FAILURES_BEFORE_COOLDOWN
+
+    # Crossing the threshold is what stops the retry storm.
+    record_once()
+    record_once()
+    assert calls["n"] == events.FAILURES_BEFORE_COOLDOWN, "the cooldown must stop a retry storm"
+    assert events._disabled_until > 0
 
 
 def test_cooldown_expires_and_the_sink_recovers(monkeypatch):
     monkeypatch.setattr(settings, "clickhouse_enabled", True)
     monkeypatch.setattr(events, "_disabled_until", 0.0)
+    monkeypatch.setattr(events, "_consecutive_failures", 0)
     attempts = {"n": 0}
 
     def broken():
