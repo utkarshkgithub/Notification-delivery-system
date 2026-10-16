@@ -88,10 +88,17 @@ def current_tenant(
     response.headers["X-RateLimit-Limit"] = str(limit)
     response.headers["X-RateLimit-Remaining"] = str(remaining)
     if not allowed:
+        # The headers are repeated here on purpose: an HTTPException builds its
+        # own response, so anything set on the injected Response is dropped.
+        # A client that is over its limit is the one that needs the limit most.
         raise HTTPException(
             429,
             "rate limit exceeded",
-            headers={"Retry-After": str(max(retry_after, 1))},
+            headers={
+                "Retry-After": str(max(retry_after, 1)),
+                "X-RateLimit-Limit": str(limit),
+                "X-RateLimit-Remaining": "0",
+            },
         )
     return tenant
 
