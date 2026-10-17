@@ -75,7 +75,10 @@ services:
     volumes:
       - chdata:/var/lib/clickhouse
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      # 127.0.0.1 rather than localhost: this image's entrypoint skips the
+      # IPv6 listener when the host has IPv6 disabled, so localhost (::1)
+      # refuses connections while the server is perfectly healthy on IPv4.
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -98,22 +101,28 @@ services:
 
   worker:
     <<: *app
+    # threads, not the default prefork: the work is I/O bound (Postgres + HTTP,
+    # where the GIL is released), and prefork would fork the delivery counters
+    # into children. /metrics is then scraped from one process and is actually
+    # true. Prefork would need prometheus multiprocess mode instead.
     command:
       [
         "celery",
         "-A",
         "app.tasks",
         "worker",
+        "--pool=threads",
+        "--concurrency=8",
         "--loglevel=info",
-        "--concurrency=4",
         "--without-gossip",
         "--without-mingle",
       ]
     environment:
       <<: *app-env
-      # Must match the broker visibility timeout so a stuck delivery is
-      # reclaimed by beat rather than after the broker gives up on it.
       METRICS_PORT: "9101"
+      # Exposed so the README's 90x benchmark is reproducible:
+      # WORKER_PREFETCH_MULTIPLIER=1 docker compose up -d worker
+      WORKER_PREFETCH_MULTIPLIER: ${WORKER_PREFETCH_MULTIPLIER:-8}
     ports:
       - "9101:9101"
 
