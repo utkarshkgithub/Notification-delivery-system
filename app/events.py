@@ -160,7 +160,16 @@ def record(
             column_names=COLUMNS,
             # async_insert lets the server merge these one-row inserts into
             # shared parts instead of writing a part per row.
-            settings={"async_insert": 1, "wait_for_async_insert": 1},
+            #
+            # wait_for_async_insert=0 is deliberate and load bearing. Waiting
+            # for the flush makes every single-row insert sit on the server's
+            # async buffer timeout, measured here at 85-220ms against 15ms to
+            # fire and forget. This is a best effort analytics sink, so paying
+            # that per event slows down the very paths it is meant to observe.
+            # The cost is that only connection and acceptance errors raise;
+            # a failure during the server side flush is not seen, which is the
+            # right trade for a store that may never break delivery.
+            settings={"async_insert": 1, "wait_for_async_insert": 0},
         )
     except Exception as exc:  # noqa: BLE001 - see module docstring
         CLICKHOUSE_WRITE_ERRORS.inc()
