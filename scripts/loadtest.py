@@ -67,8 +67,21 @@ def ingest(client: httpx.Client, api_key: str, count: int, concurrency: int, rec
     return time.perf_counter() - started, latencies, errors
 
 
+def terminal_count(client: httpx.Client, api_key: str) -> int:
+    """Terminal notifications for this tenant. Stats are tenant-wide, so a
+    repeat run against the same tenant must compare against a baseline taken
+    before it started, or the previous run's rows satisfy the drain check
+    instantly."""
+    response = client.get(
+        "/v1/stats", params={"window_seconds": 86400}, headers={"Authorization": f"Bearer {api_key}"}
+    )
+    response.raise_for_status()
+    by_status = response.json()["by_status"]
+    return by_status["delivered"] + by_status["dead"]
+
+
 def drain(client: httpx.Client, api_key: str, expected: int, timeout: float) -> tuple[float, dict]:
-    """Poll the stats endpoint until every notification reaches a terminal state."""
+    """Poll the stats endpoint until this run's notifications are all terminal."""
     headers = {"Authorization": f"Bearer {api_key}"}
     started = time.perf_counter()
     last: dict = {}
@@ -101,6 +114,7 @@ def main() -> int:
             print(f"service unhealthy: {health.text}", file=sys.stderr)
             return 1
 
+        baseline = terminal_count(client, args.api_key)
         print(f"ingesting {args.count} notifications over {args.concurrency} threads ...")
         ingest_seconds, latencies, errors = ingest(
             client, args.api_key, args.count, args.concurrency, args.recipient, args.channel
@@ -111,7 +125,7 @@ def main() -> int:
                 print(f"  {line}", file=sys.stderr)
 
         print("waiting for the queue to drain ...")
-        drain_seconds, stats = drain(client, args.api_key, args.count, args.drain_timeout)
+        drain_seconds, stats = drain(client, args.api_key, baseline + args.count, args.drain_timeout)
 
     accepted = len(latencies)
     result = {
@@ -137,6 +151,17 @@ def main() -> int:
             "deliveries_per_second": round(accepted / drain_seconds, 1) if drain_seconds else 0.0,
             "by_status": stats.get("by_status", {}),
         },
+        # The headline number: ingest start to last delivery. The drain figure
+        # alone is misleading, because the worker is already draining while
+        # ingest is still running.
+        "end_to_end": {
+            "seconds": round(ingest_seconds + drain_seconds, 3),
+            "notifications_per_second": (
+                round(accepted / (ingest_seconds + drain_seconds), 1)
+                if ingest_seconds + drain_seconds
+                else 0.0
+            ),
+        },
     }
 
     output = Path(args.output)
@@ -154,7 +179,11 @@ def main() -> int:
         f"p95 {ingest_['latency_ms']['p95']}ms  "
         f"p99 {ingest_['latency_ms']['p99']}ms"
     )
-    print(f"drain time          {delivery['seconds']}s ({delivery['deliveries_per_second']} deliveries/s)")
+    print(f"drain after ingest  {delivery['seconds']}s ({delivery['deliveries_per_second']} deliveries/s)")
+    print(
+        f"END TO END          {result['end_to_end']['seconds']}s "
+        f"({result['end_to_end']['notifications_per_second']} notifications/s, accepted to delivered)"
+    )
     print(f"final status        {delivery['by_status']}")
     print(f"written             {output}")
     return 0
