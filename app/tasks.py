@@ -49,9 +49,10 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True,
     # 1 is the safe-looking default and it throttles this stack hard: with
     # acks_late on the Redis broker, a multiplier of 1 keeps roughly one
-    # message in flight, so the pool sits idle while a task takes 33ms.
-    # Measured, 1000 notifications at concurrency 16: 195.6s end to end with 1
-    # versus 7.0s with 8 - 28x - and the worker was at 0.07% CPU in both cases.
+    # message in flight, so the pool sits idle while a task takes milliseconds.
+    # Measured on a drained queue, 1000 in_app notifications at concurrency 16:
+    # 191.0s to drain at 1 versus 3.7s at 8 - 51x - with ingest identical at
+    # ~111 req/s in both arms and the worker under one core. See the README.
     # Prefetching more only widens the window in which
     # a crashed worker has unacked messages, and a redelivery of those is
     # harmless here - attempt_delivery skips anything already in flight or
