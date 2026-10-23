@@ -169,7 +169,23 @@ turn a metric into a memory leak and a scrape into a timeout.
 
 All numbers below are from this repository on an 8-core Linux box, with every
 container (API, worker, beat, Postgres, Redis, ClickHouse, Prometheus) sharing
-those cores. Reproduce with `scripts/loadtest.py`.
+those cores.
+
+Reproduce with:
+
+```bash
+docker compose exec api python -m app.cli create-tenant bench --rate-limit-per-minute 1000000
+
+# the -v matters: `run` is ephemeral, so without it the results file is written
+# into the throwaway container and discarded
+docker compose run --rm -v "$PWD/results:/srv/results" api \
+  python scripts/loadtest.py --base-url http://api:8000 --api-key ntf_... \
+  --count 2000 --concurrency 16 --channel webhook \
+  --recipient http://demo-receiver:8090/hook
+```
+
+Use a dedicated tenant with a high rate limit: the load test will otherwise
+spend its run being correctly throttled by the limiter it is testing through.
 
 ### The one that mattered: prefetch starvation — 51x
 
