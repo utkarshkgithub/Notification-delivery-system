@@ -1,16 +1,20 @@
 """Pipeline tests: real Postgres, real cascade of state transitions, stubbed
 transport. Every assertion here is about ordering, idempotency or durability."""
 
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.cache import cache_get, cache_set, notification_key
 from app.channels import DeliveryResult, PermanentFailure
-from app.db import session_scope
+from app.db import get_engine, session_scope
 from app.models import Channel, DeliveryAttempt, Notification, Outcome, Status
 from app.tasks import (
+    _claim_attempt,
     attempt_delivery,
     backoff_seconds,
     reclaim_stuck_deliveries,
@@ -148,6 +152,92 @@ def test_in_flight_delivery_is_not_sent_again(sent, notification_factory):
 
     assert outcome.skipped is True
     assert sent.calls == []
+
+
+def test_a_second_claim_cannot_win_the_same_row(notification_factory):
+    """The double-send guard is atomic, not read-then-write.
+
+    This forces the interleaving instead of hoping for it: the claim runs from two
+    separate connections, with an uncommitted claim held on the row while the
+    second one runs. Postgres makes the second wait on the row lock, then
+    re-evaluates the predicate against the row the first connection wrote, so it
+    matches nothing.
+
+    Implemented as read-then-write this test fails, which is the point: the second
+    connection's plain SELECT does not block on an uncommitted update, so it would
+    still see `queued`, and both messages would go on to send.
+    """
+    notification = notification_factory()
+    engine = get_engine()
+
+    with engine.connect() as first, engine.connect() as second:
+        session_a = Session(bind=first)
+        session_b = Session(bind=second)
+
+        assert _claim_attempt(session_a, notification.id) == 1
+
+        claimed: dict = {}
+        reached = threading.Event()
+
+        def claim_behind_the_first() -> None:
+            reached.set()
+            claimed["attempt"] = _claim_attempt(session_b, notification.id)
+
+        thread = threading.Thread(target=claim_behind_the_first)
+        thread.start()
+        reached.wait()
+        time.sleep(0.2)  # let the second claim reach the row and block on the lock
+        first.commit()  # release it; the second re-reads what the first wrote
+        thread.join(timeout=10)
+
+        assert not thread.is_alive(), "the second claim should not have blocked forever"
+        assert claimed.get("attempt") is None, (
+            "two messages for one notification must not both own an attempt"
+        )
+        session_a.close()
+        session_b.close()
+
+
+def test_concurrent_attempts_send_once(sent, notification_factory):
+    """Duplicate messages for one notification must produce exactly one send.
+
+    This is the end-to-end shape of the guard with eight threads released
+    together. It is a coarse test: the GIL plus sub-millisecond round trips
+    usually serialise the threads, so it would not reliably catch a
+    read-then-write implementation -- `test_a_second_claim_cannot_win_the_same_row`
+    covers that deterministically. What this catches is the guard being removed or
+    bypassed entirely, and it pins the durable outcome: one send, one attempt row.
+    """
+    notification = notification_factory()
+    threads = 8
+    barrier = threading.Barrier(threads)
+    outcomes: list = []
+    lock = threading.Lock()
+
+    def attempt() -> None:
+        barrier.wait()  # start together, to collide rather than queue up
+        outcome = attempt_delivery(notification.id)
+        with lock:
+            outcomes.append(outcome)
+
+    workers = [threading.Thread(target=attempt) for _ in range(threads)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+
+    assert sent.calls == [str(notification.id)], "exactly one message may send"
+    # The losers still report delivered=True: by the time they re-read the row it
+    # is genuinely delivered, and "it got delivered" is the correct answer for a
+    # task that no longer has anything to do. What must never happen is a second
+    # send or a second claim, which is what the assertions below pin down.
+    assert len(outcomes) == threads, "every message must return rather than raise"
+    assert all(outcome.skipped or outcome.delivered for outcome in outcomes)
+
+    with session_scope() as session:
+        row = session.get(Notification, notification.id)
+        assert row.attempts == 1, "the claim must increment once, not once per message"
+    assert len(_attempts(notification.id)) == 1
 
 
 def test_stale_in_flight_delivery_is_retried(sent, notification_factory):

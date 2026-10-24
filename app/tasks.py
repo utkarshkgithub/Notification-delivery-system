@@ -1,11 +1,11 @@
 """Celery worker: the delivery pipeline.
 
 Delivery is at-least-once. Two guards keep that from turning into duplicate
-sends: a task re-enqueued while another attempt is still in flight sees status
-`delivering` and returns without sending, and every retry is a fresh message
-rather than a broker redelivery. A worker killed mid-send leaves the row in
-`delivering`; the reclaimer puts it back in the queue after
-STUCK_DELIVERY_TIMEOUT_SECONDS.
+sends: the attempt is claimed with a single conditional UPDATE, so of two
+messages for the same notification only one can proceed and the other returns
+without sending, and every retry is a fresh message rather than a broker
+redelivery. A worker killed mid-send leaves the row in `delivering`; the
+reclaimer puts it back in the queue after STUCK_DELIVERY_TIMEOUT_SECONDS.
 """
 
 import logging
@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 from celery import Celery
 from celery.signals import worker_ready
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 
 from app import events
 from app.cache import cache_delete, notification_key
@@ -115,31 +115,21 @@ def attempt_delivery(notification_id: str | uuid.UUID) -> AttemptOutcome:
     notification_id = uuid.UUID(str(notification_id))
 
     with session_scope() as session:
+        claimed_attempt = _claim_attempt(session, notification_id)
+        # Commit before the network call: holding an open transaction across a
+        # webhook timeout means holding a row lock for the whole timeout.
+        session.commit()
+
         notification = session.get(Notification, notification_id)
         if notification is None:
             log.warning("notification %s no longer exists, dropping task", notification_id)
             return AttemptOutcome(delivered=False, skipped=True)
-        if notification.status in (Status.DELIVERED, Status.DEAD):
-            # Duplicate task, or a broker redelivery after we already finished.
-            return AttemptOutcome(delivered=notification.status is Status.DELIVERED, skipped=True)
-        if notification.status is Status.DELIVERING and notification.updated_at > _now() - timedelta(
-            seconds=settings.stuck_delivery_timeout_seconds
-        ):
-            # Another attempt is in flight. Sending now would double-deliver.
-            return AttemptOutcome(delivered=False, skipped=True)
-        if notification.attempts >= notification.max_attempts:
-            return _dead_letter(
-                session, notification, "attempts already exhausted when picked up"
-            )
+        if claimed_attempt is None:
+            return _unclaimable(session, notification)
 
         channel = notification.channel.value
         tenant = notification.tenant
-        notification.status = Status.DELIVERING
-        notification.attempts += 1
-        attempt_no = notification.attempts
-        # Commit before the network call: holding an open transaction across a
-        # webhook timeout means holding a row lock for the whole timeout.
-        session.commit()
+        attempt_no = claimed_attempt
 
         started = time.perf_counter()
         try:
@@ -204,6 +194,58 @@ def attempt_delivery(notification_id: str | uuid.UUID) -> AttemptOutcome:
             delay,
         )
         return AttemptOutcome(delivered=False, retry_in=delay)
+
+
+def _claim_attempt(session, notification_id: uuid.UUID) -> int | None:
+    """Take ownership of one delivery attempt, atomically.
+
+    One conditional UPDATE rather than read-then-write. Reading the status and
+    mutating it afterwards is a race: two messages for the same notification can
+    both read `queued` and both send, which is the duplicate send this guard
+    exists to prevent. As a single statement, Postgres serialises concurrent
+    claims on the row, so one of them matches and the other gets nothing back.
+
+    Returns the attempt number this message now owns, or None if the row was not
+    claimable (terminal, already in flight, or out of attempts).
+    """
+    stale_before = _now() - timedelta(seconds=settings.stuck_delivery_timeout_seconds)
+    return session.execute(
+        update(Notification)
+        .where(
+            Notification.id == notification_id,
+            Notification.status.notin_((Status.DELIVERED, Status.DEAD)),
+            Notification.attempts < Notification.max_attempts,
+            or_(
+                Notification.status != Status.DELIVERING,
+                Notification.updated_at <= stale_before,
+            ),
+        )
+        .values(status=Status.DELIVERING, attempts=Notification.attempts + 1)
+        .returning(Notification.attempts)
+    ).scalar_one_or_none()
+
+
+def _unclaimable(session, notification: Notification) -> AttemptOutcome:
+    """Explain why the claim matched nothing, after the fact.
+
+    Only reached when the conditional UPDATE refused the row, which means it was
+    terminal, already in flight, or out of attempts. The order mirrors the claim:
+    a live in-flight attempt returns before the attempts check, so a duplicate
+    message cannot dead-letter a notification whose last attempt is still running.
+    """
+    if notification.status in (Status.DELIVERED, Status.DEAD):
+        # Duplicate task, or a broker redelivery after we already finished.
+        return AttemptOutcome(delivered=notification.status is Status.DELIVERED, skipped=True)
+    if notification.status is Status.DELIVERING:
+        # Another attempt is in flight. Sending now would double-deliver.
+        return AttemptOutcome(delivered=False, skipped=True)
+    if notification.attempts >= notification.max_attempts:
+        return _dead_letter(
+            session, notification, "attempts already exhausted when picked up"
+        )
+    # Another worker moved the row on between the claim and this read, so there
+    # is nothing left for this message to do.
+    return AttemptOutcome(delivered=False, skipped=True)
 
 
 def _dead_letter(
