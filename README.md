@@ -55,6 +55,10 @@ every performance number was measured on this code.
 | **Analytics can never fail a delivery** | The event sink is best effort and off the request path. A ClickHouse outage degrades analytics, not delivery, and shows up as `503` on the analytics endpoint rather than as an empty result that looks like real data. |
 | **`acks_late` + idempotent delivery** | A worker that dies mid-delivery must not lose the notification. Redelivery is safe because the worker checks the row's state before sending. |
 
+The full reasoning behind each of these — the alternatives that were rejected,
+and what each choice costs — is recorded in [`docs/adr/`](docs/adr/README.md).
+Start with [ADR-0001](docs/adr/0001-postgres-source-of-truth-clickhouse-events.md).
+
 ## Quickstart
 
 ```bash
@@ -291,6 +295,16 @@ check instantly — the tool reported a 0.007 s drain. It now takes a baseline
 before ingesting and measures a delta. A load generator you cannot trust is
 worse than none, because it turns into a number on a resume.
 
+**5. The double-send guard was check-then-act, so it could double-send.** The
+worker read the row, checked the status, and mutated it afterwards. Two messages
+for the same notification could both read `queued` before either wrote, and both
+send — and a duplicated message is the *normal* way to reach that guard, since
+the sweeper and reclaimer re-publish. It is now a single conditional
+`UPDATE ... RETURNING` that claims the attempt, so Postgres serialises the two and
+exactly one can win. Verified by a test that forces the overlap across two
+connections with the first held uncommitted; that test fails against the
+read-then-write version, which is how it earns the right to exist.
+
 Also: dropped redundant single-column indexes in favour of one composite (the
 planner was ignoring the extras), and moved the worker from the default
 `prefork` pool to `threads` so `/metrics` reports one coherent registry instead
@@ -299,7 +313,7 @@ of forking delivery counters into children that are never scraped.
 ## Tests
 
 ```bash
-docker compose run --rm -v "$PWD":/srv api pytest -q     # 75 passed
+docker compose run --rm -v "$PWD":/srv api pytest -q     # 77 passed
 ```
 
 The suite runs against **real Postgres and Redis**, not mocks of the pipeline.
@@ -310,7 +324,8 @@ path, reclaimer and request-scoped caches are exercised for real:
   without gaps or repeats, filters, stats, tenant isolation.
 - `test_delivery.py` — success, 5xx retry with backoff, permanent 4xx, exhaustion
   to dead, manual retry, cache invalidation, stuck delivery reclaimed, queued
-  sweeper including the notifications it must *not* touch.
+  sweeper including the notifications it must *not* touch, and the atomic claim
+  that stops two concurrent messages from both sending.
 - `test_ratelimit.py` — bucket capacity, the headers on `429`, rejected requests
   not stored, per-tenant override, fail-open when Redis is down.
 - `test_signing.py` — signature verification and replay-window rejection.
